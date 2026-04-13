@@ -500,6 +500,10 @@ def step_5_verify():
         return
     if st.session_state.masked_df is not None:
         st.dataframe(st.session_state.masked_df.head(5), use_container_width=True)
+        st.markdown(
+            '<div style="color: rgba(107,114,128,0.78); font-size: 12px; margin-top: 4px;">可以在下列示例表格第一列随意复制一个VIN码进行篡改验证</div>',
+            unsafe_allow_html=True,
+        )
     vin_input = st.text_input("🔎 请输入 VIN 码进行验证")
     if st.button("✅ 执行篡改验证", use_container_width=True):
         message = verify_by_vin(st.session_state.hashed_df, vin_input)

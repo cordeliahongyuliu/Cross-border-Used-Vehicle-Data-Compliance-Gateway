@@ -5,6 +5,10 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfgen import canvas
 
 
 WHITE_LIST = [
@@ -159,11 +163,9 @@ def calc_hash_steps(payload):
 def build_hash_chain(df):
     result_df = df.copy()
     hash_cols = get_hash_columns(result_df)
-    hashes = []
-    for _, row in result_df.iterrows():
-        _, _, h3 = calc_hash_steps(row_payload(row, hash_cols))
-        hashes.append(h3)
-    result_df["hash"] = hashes
+    result_df["hash"] = [
+        calc_hash_steps(row_payload(row, hash_cols))[2] for _, row in result_df.iterrows()
+    ]
     return result_df
 
 
@@ -184,8 +186,8 @@ def verify_by_vin(df_with_hash, vin_input):
     hash_cols = get_hash_columns(df_with_hash)
     for _, row in candidates.iterrows():
         current_hash = normalize_value(row.get("hash", ""))
-        _, _, recalculated = calc_hash_steps(row_payload(row, hash_cols))
-        if current_hash == recalculated:
+        recalculated_hash = calc_hash_steps(row_payload(row, hash_cols))[2]
+        if current_hash == recalculated_hash:
             return "数据真实有效"
     return "数据已被篡改"
 
@@ -220,16 +222,11 @@ def build_embedded_default_df():
                 "address": r[9],
             }
         )
-    df = pd.DataFrame(data)
-    df = map_columns(df)
-    if "vin_code" in df.columns:
-        df["vin_code"] = df["vin_code"].apply(normalize_vin)
-    return df
+    return pd.DataFrame(data)
 
 
 @st.cache_data
 def get_embedded_default_excel_bytes():
-    # Used only for download. If excel engine is missing, return None and keep page alive.
     try:
         df = build_embedded_default_df()
         bio = BytesIO()
@@ -240,8 +237,7 @@ def get_embedded_default_excel_bytes():
 
 
 def load_embedded_default_df():
-    # Always available without file path dependency.
-    return build_embedded_default_df()
+    return load_excel(BytesIO(get_embedded_default_excel_bytes()))
 
 
 def go_next_if_allowed(allowed):
@@ -347,66 +343,78 @@ def render_certificate_preview(cert):
     st.markdown(html, unsafe_allow_html=True)
 
 
-def generate_pdf_bytes(cert):
-    lines = [
-        "Used Car Cross-border Trusted Data Certificate",
-        "",
-        f"VIN: {cert['vin_code']}",
-        f"Brand Model: {cert['brand_model']}",
-        f"Engine: {cert['engine_displacement']}",
-        f"Manufacture Date: {cert['manufacture_date']}",
-        f"Mileage: {cert['mileage']}",
-        f"Accident Summary: {cert['accident_summary']}",
-        "",
-        "Desensitized Data:",
-        f"Owner: {cert['owner_name']}",
-        f"Repair Shop: {cert['repair_shop']}",
-        f"Phone: {cert['phone_number']}",
-        "",
-        "Hash Chain:",
-        f"h1: {cert['h1']}",
-        f"h2: {cert['h2']}",
-        f"h3: {cert['h3']}",
-        "",
-        f"Compliance Timestamp: {cert['compliance_timestamp']}",
-        f"Compliance Status: {cert['compliance_status']}",
-        f"Generated At: {cert['generate_time']}",
-    ]
-    content = ["BT", "/F1 10 Tf", "50 820 Td"]
-    y = 820
-    for idx, line in enumerate(lines):
-        safe = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-        if idx == 0:
-            content.append(f"({safe}) Tj")
+def _wrap_text(text, font_name, font_size, max_width):
+    lines = []
+    current = ""
+    for ch in text:
+        candidate = current + ch
+        if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
+            current = candidate
         else:
-            content.append("0 -16 Td")
-            content.append(f"({safe}) Tj")
-        y -= 16
-        if y < 40:
-            break
-    content.append("ET")
-    stream_data = "\n".join(content).encode("latin-1", errors="replace")
+            lines.append(current)
+            current = ch
+    if current:
+        lines.append(current)
+    return lines
 
-    objects = [
-        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
-        b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n",
-        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n",
-        b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n",
-        b"5 0 obj << /Length " + str(len(stream_data)).encode("ascii") + b" >> stream\n" + stream_data + b"\nendstream endobj\n",
-    ]
 
-    pdf = b"%PDF-1.4\n"
-    offsets = [0]
-    for obj in objects:
-        offsets.append(len(pdf))
-        pdf += obj
-    xref_pos = len(pdf)
-    pdf += b"xref\n0 6\n0000000000 65535 f \n"
-    for i in range(1, 6):
-        pdf += f"{offsets[i]:010d} 00000 n \n".encode("ascii")
-    pdf += b"trailer << /Size 6 /Root 1 0 R >>\nstartxref\n"
-    pdf += str(xref_pos).encode("ascii") + b"\n%%EOF"
-    return pdf
+def generate_pdf_bytes(cert):
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    page_w, page_h = A4
+
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        font_name = "STSong-Light"
+    except Exception:
+        font_name = "Helvetica"
+
+    x = 50
+    y = page_h - 60
+    right = page_w - 50
+    max_w = right - x
+
+    def draw_line(label, value, size=11):
+        nonlocal y
+        txt = f"{label}：{value}"
+        wrapped = _wrap_text(txt, font_name, size, max_w)
+        c.setFont(font_name, size)
+        for line in wrapped:
+            if y < 70:
+                c.showPage()
+                c.setFont(font_name, size)
+                y = page_h - 60
+            c.drawString(x, y, line)
+            y -= 16
+
+    c.setFont(font_name, 18)
+    c.drawCentredString(page_w / 2, y, cert["title"])
+    y -= 30
+    c.setFont(font_name, 11)
+    c.drawString(x, y, f"证书生成时间：{cert['generate_time']}")
+    y -= 24
+
+    draw_line("VIN", cert["vin_code"])
+    draw_line("品牌型号", cert["brand_model"])
+    draw_line("排量", cert["engine_displacement"])
+    draw_line("生产日期", cert["manufacture_date"])
+    draw_line("里程", cert["mileage"])
+    draw_line("事故概况", cert["accident_summary"])
+    y -= 8
+    draw_line("车主姓名", cert["owner_name"])
+    draw_line("维修机构", cert["repair_shop"])
+    draw_line("联系电话", cert["phone_number"])
+    y -= 8
+    draw_line("h1", cert["h1"], size=9)
+    draw_line("h2", cert["h2"], size=9)
+    draw_line("h3", cert["h3"], size=9)
+    y -= 8
+    draw_line("合规处理时间", cert["compliance_timestamp"])
+    draw_line("合规状态", cert["compliance_status"])
+
+    c.showPage()
+    c.save()
+    return buffer.getvalue()
 
 
 def step_1_prepare_data():
@@ -506,8 +514,7 @@ def step_5_verify():
         )
     vin_input = st.text_input("🔎 请输入 VIN 码进行验证")
     if st.button("✅ 执行篡改验证", use_container_width=True):
-        message = verify_by_vin(st.session_state.hashed_df, vin_input)
-        show_verify_dialog(message)
+        show_verify_dialog(verify_by_vin(st.session_state.hashed_df, vin_input))
     go_next_if_allowed(True)
 
 
@@ -516,16 +523,17 @@ def step_6_certificate():
     if st.session_state.hashed_df is None:
         st.warning("请先完成 Step 4。")
         return
+
     vin_input = st.text_input("🔎 请输入 VIN 码查询证书")
     row = find_row_by_vin(st.session_state.hashed_df, vin_input)
     if row is None:
         return
+
     cert = build_certificate_dict(row)
     render_certificate_preview(cert)
-    pdf_bytes = generate_pdf_bytes(cert)
     st.download_button(
         "点击下载 PDF 证书",
-        data=pdf_bytes,
+        data=generate_pdf_bytes(cert),
         file_name=f"二手车跨境数据可信存证证书_{cert['vin_code']}.pdf",
         mime="application/pdf",
         type="primary",

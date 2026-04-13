@@ -105,6 +105,13 @@ def load_excel(source):
     return df
 
 
+def try_load_excel(source):
+    try:
+        return load_excel(source), None
+    except Exception as e:
+        return None, str(e)
+
+
 def desensitize_data(df):
     processed_df = df.copy()
     drop_cols = [col for col in BLACK_LIST if col in processed_df.columns]
@@ -162,9 +169,9 @@ def build_hash_chain(df):
 
 def verify_by_vin(df_with_hash, vin_input):
     if "vin_code" not in df_with_hash.columns:
-        return "验证失败：数据中没有 vin_code 列（请检查上传表头）"
+        return "验证失败：数据中没有 vin_code 列"
     if "hash" not in df_with_hash.columns:
-        return "验证失败：数据中没有 hash 列（请先生成哈希链）"
+        return "验证失败：数据中没有 hash 列"
 
     query_vin = normalize_vin(vin_input)
     if query_vin == "":
@@ -184,7 +191,7 @@ def verify_by_vin(df_with_hash, vin_input):
 
 
 @st.cache_data
-def get_embedded_default_excel_bytes():
+def build_embedded_default_df():
     rows = [
         ["LSVPC69ZCANLP5PC2", "大众 帕萨特", "1.8T", "2019-05-21", "65000", "轻微剐蹭已修复", "张三", "成都某维修中心", "13812345678", "四川省成都市高新区"],
         ["LFV2A2157K3000888", "奥迪 A6L", "2.0T", "2018-11-12", "82000", "无重大事故", "李四", "天府汽修厂", "13912345678", "四川省成都市武侯区"],
@@ -214,13 +221,27 @@ def get_embedded_default_excel_bytes():
             }
         )
     df = pd.DataFrame(data)
-    bio = BytesIO()
-    df.to_excel(bio, index=False)
-    return bio.getvalue()
+    df = map_columns(df)
+    if "vin_code" in df.columns:
+        df["vin_code"] = df["vin_code"].apply(normalize_vin)
+    return df
+
+
+@st.cache_data
+def get_embedded_default_excel_bytes():
+    # Used only for download. If excel engine is missing, return None and keep page alive.
+    try:
+        df = build_embedded_default_df()
+        bio = BytesIO()
+        df.to_excel(bio, index=False)
+        return bio.getvalue()
+    except Exception:
+        return None
 
 
 def load_embedded_default_df():
-    return load_excel(BytesIO(get_embedded_default_excel_bytes()))
+    # Always available without file path dependency.
+    return build_embedded_default_df()
 
 
 def go_next_if_allowed(allowed):
@@ -327,7 +348,6 @@ def render_certificate_preview(cert):
 
 
 def generate_pdf_bytes(cert):
-    # Minimal PDF generation (no external dependency required)
     lines = [
         "Used Car Cross-border Trusted Data Certificate",
         "",
@@ -352,30 +372,28 @@ def generate_pdf_bytes(cert):
         f"Compliance Status: {cert['compliance_status']}",
         f"Generated At: {cert['generate_time']}",
     ]
-    y = 800
     content = ["BT", "/F1 10 Tf", "50 820 Td"]
-    for i, line in enumerate(lines):
-        safe_line = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-        if i == 0:
-            content.append(f"({safe_line}) Tj")
+    y = 820
+    for idx, line in enumerate(lines):
+        safe = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        if idx == 0:
+            content.append(f"({safe}) Tj")
         else:
-            dy = -16
-            content.append(f"0 {dy} Td")
-            content.append(f"({safe_line}) Tj")
+            content.append("0 -16 Td")
+            content.append(f"({safe}) Tj")
         y -= 16
         if y < 40:
             break
     content.append("ET")
     stream_data = "\n".join(content).encode("latin-1", errors="replace")
 
-    objects = []
-    objects.append(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n")
-    objects.append(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n")
-    objects.append(b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n")
-    objects.append(b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n")
-    objects.append(
-        b"5 0 obj << /Length " + str(len(stream_data)).encode("ascii") + b" >> stream\n" + stream_data + b"\nendstream endobj\n"
-    )
+    objects = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n",
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n",
+        b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n",
+        b"5 0 obj << /Length " + str(len(stream_data)).encode("ascii") + b" >> stream\n" + stream_data + b"\nendstream endobj\n",
+    ]
 
     pdf = b"%PDF-1.4\n"
     offsets = [0]
@@ -395,28 +413,39 @@ def step_1_prepare_data():
     st.subheader("Step 1 · 数据准备")
     uploaded_file = st.file_uploader("📤 上传车源数据（Excel）", type=["xlsx", "xls"])
     c1, c2 = st.columns([1, 1])
+
     with c1:
         if st.button("🧪 使用内嵌示例数据", use_container_width=True):
             st.session_state.raw_df = load_embedded_default_df()
             st.session_state.uploaded_signature = "embedded_default"
             reset_pipeline_state()
             st.success("已加载内嵌示例数据。")
+
     with c2:
-        st.download_button(
-            "📥 下载示例Excel",
-            data=get_embedded_default_excel_bytes(),
-            file_name="成都出口车源模拟数据.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+        sample_excel = get_embedded_default_excel_bytes()
+        if sample_excel is not None:
+            st.download_button(
+                "📥 下载示例Excel",
+                data=sample_excel,
+                file_name="成都出口车源模拟数据.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        else:
+            st.button("📥 下载示例Excel", disabled=True, use_container_width=True)
 
     if uploaded_file is not None:
         signature = f"{uploaded_file.name}_{uploaded_file.size}"
         if st.session_state.uploaded_signature != signature:
-            st.session_state.raw_df = load_excel(uploaded_file)
-            st.session_state.uploaded_signature = signature
-            reset_pipeline_state()
-            st.success("文件上传成功。")
+            df, err = try_load_excel(uploaded_file)
+            if err is None:
+                st.session_state.raw_df = df
+                st.session_state.uploaded_signature = signature
+                reset_pipeline_state()
+                st.success("文件上传成功。")
+            else:
+                st.error(f"Excel读取失败：{err}")
+
     go_next_if_allowed(st.session_state.raw_df is not None)
 
 
@@ -437,7 +466,10 @@ def step_3_desensitize():
     if st.button("🛡️ 执行数据脱敏", use_container_width=True):
         st.session_state.masked_df = desensitize_data(st.session_state.raw_df)
         st.session_state.hashed_df = None
-        st.session_state.masked_df.to_excel("脱敏后_成都出口车源数据.xlsx", index=False)
+        try:
+            st.session_state.masked_df.to_excel("脱敏后_成都出口车源数据.xlsx", index=False)
+        except Exception:
+            pass
         st.success("脱敏完成。")
     if st.session_state.masked_df is not None:
         st.dataframe(st.session_state.masked_df, use_container_width=True)
@@ -451,7 +483,10 @@ def step_4_hash_chain():
         return
     if st.button("⛓️ 生成哈希链（模拟上链）", use_container_width=True):
         st.session_state.hashed_df = build_hash_chain(st.session_state.masked_df)
-        st.session_state.hashed_df.to_excel("哈希链存证记录.xlsx", index=False)
+        try:
+            st.session_state.hashed_df.to_excel("哈希链存证记录.xlsx", index=False)
+        except Exception:
+            pass
         st.success("哈希链生成完成。")
     if st.session_state.hashed_df is not None:
         st.dataframe(st.session_state.hashed_df, use_container_width=True)
@@ -477,15 +512,12 @@ def step_6_certificate():
     if st.session_state.hashed_df is None:
         st.warning("请先完成 Step 4。")
         return
-
     vin_input = st.text_input("🔎 请输入 VIN 码查询证书")
     row = find_row_by_vin(st.session_state.hashed_df, vin_input)
     if row is None:
         return
-
     cert = build_certificate_dict(row)
     render_certificate_preview(cert)
-
     pdf_bytes = generate_pdf_bytes(cert)
     st.download_button(
         "点击下载 PDF 证书",
@@ -501,8 +533,8 @@ def main():
     st.set_page_config(page_title="跨境二手车数据合规网关", layout="wide")
     init_session_state()
     render_sidebar()
-
     st.title("跨境二手车数据合规网关")
+
     current = st.session_state.current_step
     if current == 0:
         step_1_prepare_data()

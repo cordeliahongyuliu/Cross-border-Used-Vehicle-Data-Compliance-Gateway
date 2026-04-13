@@ -5,10 +5,6 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.pdfgen import canvas
 
 
 WHITE_LIST = [
@@ -237,7 +233,11 @@ def get_embedded_default_excel_bytes():
 
 
 def load_embedded_default_df():
-    return load_excel(BytesIO(get_embedded_default_excel_bytes()))
+    df = build_embedded_default_df().copy()
+    df = map_columns(df)
+    if "vin_code" in df.columns:
+        df["vin_code"] = df["vin_code"].apply(normalize_vin)
+    return df
 
 
 def go_next_if_allowed(allowed):
@@ -344,6 +344,8 @@ def render_certificate_preview(cert):
 
 
 def _wrap_text(text, font_name, font_size, max_width):
+    from reportlab.pdfbase import pdfmetrics
+
     lines = []
     current = ""
     for ch in text:
@@ -359,6 +361,11 @@ def _wrap_text(text, font_name, font_size, max_width):
 
 
 def generate_pdf_bytes(cert):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfgen import canvas
+
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     page_w, page_h = A4
